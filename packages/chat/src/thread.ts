@@ -3,7 +3,7 @@ import type { Root } from "mdast";
 import { processCardCallbackUrls } from "./callback-url";
 import { cardToFallbackText } from "./cards";
 import { ChannelImpl, deriveChannelId } from "./channel";
-import { getChatSingleton } from "./chat-singleton";
+import { ChatBinding, type ChatSingleton } from "./chat-singleton";
 import { fromFullStream } from "./from-full-stream";
 import { type ChatElement, isJSX, toCardElement } from "./jsx-runtime";
 import type { Logger } from "./logger";
@@ -14,7 +14,7 @@ import {
   text as textNode,
   toPlainText,
 } from "./markdown";
-import { Message, type SerializedMessage } from "./message";
+import { Message, type SerializedMessage, setMessageAdapter } from "./message";
 import { isPostableObject, postPostableObject } from "./postable-object";
 import { StreamingMarkdownRenderer } from "./streaming-markdown";
 import type { ThreadHistoryCache } from "./thread-history";
@@ -81,6 +81,7 @@ interface ThreadImplConfigLazy {
   adapterName: string;
   channelId: string;
   channelVisibility?: ChannelVisibility;
+  chat?: ChatSingleton;
   currentMessage?: Message;
   fallbackStreamingPlaceholderText?: string | null;
   id: string;
@@ -162,6 +163,8 @@ export class ThreadImpl<TState = Record<string, unknown>>
 
   /** Direct adapter instance (if provided) */
   private _adapter?: Adapter;
+  /** Chat ownership for restored threads */
+  private readonly _binding?: ChatBinding;
   /** Adapter name for lazy resolution */
   private readonly _adapterName?: string;
   /** Direct state adapter instance (if provided) */
@@ -171,7 +174,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
   /** Current message context for streaming - provides userId/teamId */
   private readonly _currentMessage?: Message;
   /** Update interval for fallback streaming */
-  private readonly _streamingUpdateIntervalMs: number;
+  private readonly _streamingUpdateIntervalMs: number | undefined;
   /** Placeholder text for fallback streaming (post + edit) */
   private readonly _fallbackStreamingPlaceholderText: string | null | undefined;
   /** Cached channel instance */
@@ -190,13 +193,14 @@ export class ThreadImpl<TState = Record<string, unknown>>
     this._isSubscribedContext = config.isSubscribedContext ?? false;
     this._currentMessage = config.currentMessage;
     this._logger = config.logger;
-    this._streamingUpdateIntervalMs = config.streamingUpdateIntervalMs ?? 500;
+    this._streamingUpdateIntervalMs = config.streamingUpdateIntervalMs;
     this._fallbackStreamingPlaceholderText =
       config.fallbackStreamingPlaceholderText;
 
     if (isLazyConfig(config)) {
       // Lazy resolution mode - store adapter name for later lookup
       this._adapterName = config.adapterName;
+      this._binding = new ChatBinding(config.chat);
     } else {
       // Direct mode - store adapter and state instances
       this._adapter = config.adapter;
@@ -215,25 +219,17 @@ export class ThreadImpl<TState = Record<string, unknown>>
    */
   get adapter(): Adapter {
     if (this._adapter) {
+      this._binding?.resolveOwner(this._adapter);
       return this._adapter;
     }
 
-    if (!this._adapterName) {
+    if (!(this._adapterName && this._binding)) {
       throw new Error("Thread has no adapter configured");
     }
 
-    // Lazy resolution from singleton
-    const chat = getChatSingleton();
-    const adapter = chat.getAdapter(this._adapterName);
-    if (!adapter) {
-      throw new Error(
-        `Adapter "${this._adapterName}" not found in Chat singleton`
-      );
-    }
-
-    // Cache for subsequent accesses
-    this._adapter = adapter;
-    return adapter;
+    // Lazy resolution from singleton (cached for subsequent accesses)
+    this._adapter = this._binding.resolveAdapter(this._adapterName);
+    return this._adapter;
   }
 
   /**
@@ -245,10 +241,16 @@ export class ThreadImpl<TState = Record<string, unknown>>
       return this._stateAdapterInstance;
     }
 
-    // Lazy resolution from singleton
-    const chat = getChatSingleton();
-    this._stateAdapterInstance = chat.getState();
-    return this._stateAdapterInstance;
+    if (!this._binding) {
+      throw new Error("Thread has no state adapter configured");
+    }
+
+    // Lazy resolution; only cache state from the Chat that owns the adapter
+    const { owned, state } = this._binding.resolveState(this.adapter);
+    if (owned) {
+      this._stateAdapterInstance = state;
+    }
+    return state;
   }
 
   get recentMessages(): Message[] {
@@ -469,7 +471,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
           };
         };
         const streamOptions: StreamOptions = {
-          ...(data.options.updateIntervalMs
+          ...(data.options.updateIntervalMs !== undefined
             ? { updateIntervalMs: data.options.updateIntervalMs }
             : {}),
           ...(data.options.groupTasks
@@ -739,16 +741,25 @@ export class ThreadImpl<TState = Record<string, unknown>>
   ): Promise<SentMessage> {
     // Normalize: handles plain strings, AI SDK fullStream events, and StreamChunk objects
     const textStream = takeUntilAborted(fromFullStream(rawStream), this.signal);
+    const adapter = this.adapter;
+    const defaults = this._binding
+      ?.resolveOwner(adapter)
+      ?.getStreamingOptions();
+    const placeholder =
+      this._fallbackStreamingPlaceholderText !== undefined
+        ? this._fallbackStreamingPlaceholderText
+        : defaults?.fallbackStreamingPlaceholderText;
     // Build streaming options from current message context + caller options
     const options: StreamOptions = {
       signal: this.signal,
-      updateIntervalMs: this._streamingUpdateIntervalMs,
       ...callerOptions,
-      ...(this._fallbackStreamingPlaceholderText !== undefined
-        ? {
-            fallbackStreamingPlaceholderText:
-              this._fallbackStreamingPlaceholderText,
-          }
+      updateIntervalMs:
+        callerOptions?.updateIntervalMs ??
+        this._streamingUpdateIntervalMs ??
+        defaults?.updateIntervalMs ??
+        500,
+      ...(placeholder !== undefined
+        ? { fallbackStreamingPlaceholderText: placeholder }
         : {}),
     };
     if (this._currentMessage) {
@@ -762,7 +773,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
     }
 
     // Use adapter-provided streaming if available.
-    if (this.adapter.stream) {
+    if (adapter.stream) {
       // Wrap stream to collect accumulated text while passing through to adapter.
       // StreamChunk objects are passed through; only plain strings are accumulated.
       let accumulated = "";
@@ -789,7 +800,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
 
       let raw: RawMessage<unknown> | null;
       try {
-        raw = await this.adapter.stream(this.id, wrappedStream, options);
+        raw = await adapter.stream(this.id, wrappedStream, options);
       } catch (error) {
         await this.finishTyping();
         throw error;
@@ -951,12 +962,11 @@ export class ThreadImpl<TState = Record<string, unknown>>
     textStream: AsyncIterable<string>,
     options?: StreamOptions
   ): Promise<SentMessage> {
-    const intervalMs =
-      options?.updateIntervalMs ?? this._streamingUpdateIntervalMs;
+    const intervalMs = options?.updateIntervalMs ?? 500;
     const placeholderText =
-      this._fallbackStreamingPlaceholderText === undefined
+      options?.fallbackStreamingPlaceholderText === undefined
         ? "..."
-        : this._fallbackStreamingPlaceholderText;
+        : options.fallbackStreamingPlaceholderText;
     let msg: { id: string; threadId: string; raw: unknown } | null =
       placeholderText === null
         ? null
@@ -1121,11 +1131,13 @@ export class ThreadImpl<TState = Record<string, unknown>>
    */
   static fromJSON<TState = Record<string, unknown>>(
     json: SerializedThread,
-    adapter?: Adapter
+    adapter?: Adapter,
+    chat?: ChatSingleton
   ): ThreadImpl<TState> {
     const thread = new ThreadImpl<TState>({
       id: json.id,
       adapterName: json.adapterName,
+      chat,
       channelId: json.channelId,
       channelVisibility: json.channelVisibility,
       currentMessage: json.currentMessage
@@ -1135,6 +1147,10 @@ export class ThreadImpl<TState = Record<string, unknown>>
     });
     if (adapter) {
       thread._adapter = adapter;
+    }
+    const owned = adapter ?? chat?.getAdapter(json.adapterName);
+    if (chat && owned && thread._currentMessage) {
+      setMessageAdapter(thread._currentMessage, owned);
     }
     return thread;
   }

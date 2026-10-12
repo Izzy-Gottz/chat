@@ -506,7 +506,8 @@ export interface TelegramMessage {
     total_amount: number;
   };
   /**
-   * True if the message is sent to a forum topic. Absent for messages in
+   * True if the message is sent to a topic in a forum supergroup or a private
+   * chat with the bot. Absent for messages in
    * regular (non-forum) supergroups, whose `message_thread_id` identifies a
    * reply thread rather than a topic.
    */
